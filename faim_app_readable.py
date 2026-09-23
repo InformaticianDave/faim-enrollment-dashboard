@@ -16,6 +16,16 @@ import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 from io import BytesIO
 from copy import deepcopy
+import re
+from collections import Counter
+
+# Statsmodels/scipy power the Site Comparison and Statistical Modeling tabs
+# (chi-square test, binomial/Poisson/negative-binomial GLMs). Both tabs
+# degrade gracefully with a warning if these aren't installed.
+try:
+    import statsmodels.api as sm; import statsmodels.formula.api as smf; from scipy.stats import chi2_contingency; HAS_STATS = True
+except ImportError:
+    HAS_STATS = False
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -763,12 +773,17 @@ download_dataframe('⬇ Download Current Filtered Dataset', df, 'filtered_datase
 # ═══════════════════════════════════════════════════
 # ANALYSIS TABS
 # ═══════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "📊  Overview",
     "📅  Weekly Summary",
     "📆  Monthly Enrollment",
     "🗓  Biweekly Periods",
     "📈  Cumulative vs Expected",
+    "🔻  Funnel Analysis",
+    "🏢  Site Comparison",
+    "📉  Time Trends",
+    "🧮  Statistical Models",
+    "🔍  Data Quality",
 ])
 
 
@@ -1244,3 +1259,661 @@ with tab5:
     pvt_final['Cumulative'] = pvt_final['All Sites'].cumsum()
     download_dataframe('⬇ Download Monthly Detail', pvt_final, 'cumulative_monthly_detail_filtered.csv', 'dl_monthly_detail')
     st.dataframe(pvt_final, use_container_width=True, height=340)
+
+
+# ────────────────────────────────────────────────────
+# TAB 6 — FUNNEL / CONVERSION ANALYSIS
+# ────────────────────────────────────────────────────
+with tab6:
+    st.markdown('<div class="info-banner">📌 Antenatal and NICU screening funnels, where eligible subjects are lost at each stage, and a side-by-side consent-rate comparison between arms.</div>', unsafe_allow_html=True)
+
+    ant_elig_total  = int(df['antscreen_eligible'].sum())
+    ant_cons_total  = int(df['antconsent_random'].sum())
+    nicu_elig_total = int(df['nicu_eligible1'].sum())
+    nicu_cons_total = int(df['nicu_randomized'].sum())
+
+    render_kpis([
+        {"label": "Antenatal Eligible",  "value": f"{ant_elig_total:,}",  "cls": ""},
+        {"label": "Antenatal Consented", "value": f"{ant_cons_total:,}",  "cls": "green",
+         "sub": f"{(ant_cons_total/ant_elig_total*100 if ant_elig_total else 0):.1f}% of eligible"},
+        {"label": "NICU Eligible",       "value": f"{nicu_elig_total:,}", "cls": ""},
+        {"label": "NICU Consented",      "value": f"{nicu_cons_total:,}", "cls": "teal",
+         "sub": f"{(nicu_cons_total/nicu_elig_total*100 if nicu_elig_total else 0):.1f}% of eligible"},
+    ])
+
+    # ---- Funnel charts ----
+    st.markdown('<div class="section-title">Antenatal vs. NICU Screening Funnels</div>', unsafe_allow_html=True)
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        ant_stages = ['Screened', 'Screen-Eligible', 'Approached', 'Consented / Randomized']
+        ant_vals = [
+            int(df['antscreen_number'].sum()),
+            ant_elig_total,
+            int(df['antscreen_approached'].sum()),
+            ant_cons_total,
+        ]
+        fig_fa = go.Figure(go.Funnel(
+            y=ant_stages, x=ant_vals,
+            marker=dict(color=['#c7dcf5', '#92b4e3', '#1e6fd9', '#0b1a36']),
+            textinfo='value+percent initial',
+            connector=dict(line=dict(color='#c7d3e6', width=1)),
+        ))
+        fig_fa.update_layout(**plotly_layout(height=380, title='Antenatal Funnel'))
+        st.plotly_chart(fig_fa, use_container_width=True, theme=None)
+    with fcol2:
+        nicu_stages = ['GA-Screened', 'Eligible', 'Approached', 'Consented / Randomized']
+        nicu_vals = [
+            int(df['nicu_gascreen'].sum()),
+            nicu_elig_total,
+            int(df['nicu_approached'].sum()),
+            nicu_cons_total,
+        ]
+        fig_fn = go.Figure(go.Funnel(
+            y=nicu_stages, x=nicu_vals,
+            marker=dict(color=['#c8ecd6', '#6fc48f', '#2a9d5c', '#0f3d24']),
+            textinfo='value+percent initial',
+            connector=dict(line=dict(color='#c7d3e6', width=1)),
+        ))
+        fig_fn.update_layout(**plotly_layout(height=380, title='NICU Funnel'))
+        st.plotly_chart(fig_fn, use_container_width=True, theme=None)
+    st.caption("Percentages are relative to the first stage of each funnel (100% initial). The two arms use different screening definitions upstream, so compare shape (drop-off between stages), not raw stage-to-stage totals across arms.")
+
+    # ---- Drop-off analysis ----
+    st.markdown('<div class="section-title">Drop-off Analysis — Where Eligible Subjects Are Lost</div>', unsafe_allow_html=True)
+    dropoff = pd.DataFrame([
+        {'Arm': 'Antenatal', 'Reason': 'Not Approached', 'Count': int(df['antscreen_no_approach'].sum())},
+        {'Arm': 'Antenatal', 'Reason': 'Declined',        'Count': int(df['antapproach_declined'].sum())},
+        {'Arm': 'Antenatal', 'Reason': 'Deferred',        'Count': int(df['antapproach_defer'].sum())},
+        {'Arm': 'Antenatal', 'Reason': 'Aged Out',        'Count': int(df['antapproach_agedout'].sum())},
+        {'Arm': 'NICU',      'Reason': 'Not Approached',  'Count': int(df['nicu_notapproach'].sum())},
+        {'Arm': 'NICU',      'Reason': 'Declined',        'Count': int(df['nicu_decline'].sum())},
+        {'Arm': 'NICU',      'Reason': 'Too Late',        'Count': int(df['nicu_toolate'].sum())},
+    ])
+    dropoff['Eligible Pool'] = dropoff['Arm'].map({'Antenatal': ant_elig_total, 'NICU': nicu_elig_total})
+    dropoff['% of Eligible'] = (dropoff['Count'] / dropoff['Eligible Pool'].replace(0, np.nan) * 100).round(1)
+
+    dcol1, dcol2 = st.columns([1.3, 1])
+    with dcol1:
+        fig_do = px.bar(dropoff, x='Reason', y='Count', color='Arm', barmode='group',
+                         color_discrete_map={'Antenatal': '#1e6fd9', 'NICU': '#2a9d5c'}, text='Count')
+        fig_do.update_traces(textposition='outside')
+        fig_do.update_layout(**plotly_layout(height=380, xaxis_title='Drop-off Reason', yaxis_title='Subjects Lost'))
+        fig_do.update_traces(textfont_color="#0f1f3d", cliponaxis=False)
+        st.plotly_chart(fig_do, use_container_width=True, theme=None)
+    with dcol2:
+        disp_do = dropoff.set_index(['Arm', 'Reason'])
+        download_dataframe('⬇ Download Drop-off Table', disp_do, 'dropoff_analysis_filtered.csv', 'dl_dropoff')
+        st.dataframe(disp_do, use_container_width=True, height=320)
+
+    # ---- Antenatal vs NICU consent-rate comparison ----
+    st.markdown('<div class="section-title">Antenatal vs. NICU Consent Rate — Overall & by Site</div>', unsafe_allow_html=True)
+    arm_site = df.groupby('screening_site').agg(
+        ant_elig=('antscreen_eligible', 'sum'), ant_cons=('antconsent_random', 'sum'),
+        nicu_elig=('nicu_eligible1', 'sum'),   nicu_cons=('nicu_randomized', 'sum'),
+    ).reset_index()
+    arm_site['Antenatal'] = (arm_site['ant_cons']  / arm_site['ant_elig'].replace(0, np.nan)  * 100).round(1)
+    arm_site['NICU']      = (arm_site['nicu_cons'] / arm_site['nicu_elig'].replace(0, np.nan) * 100).round(1)
+    arm_long = arm_site.melt(id_vars='screening_site', value_vars=['Antenatal', 'NICU'],
+                              var_name='Arm', value_name='Rate')
+
+    fig_arm = px.bar(arm_long, x='screening_site', y='Rate', color='Arm', barmode='group', text='Rate',
+                      color_discrete_map={'Antenatal': '#1e6fd9', 'NICU': '#2a9d5c'})
+    fig_arm.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+    fig_arm.update_layout(**plotly_layout(height=380, xaxis_title='Site', yaxis_title='Consent Rate (%)',
+                                           legend_title='Arm'))
+    fig_arm.update_traces(textfont_color="#0f1f3d", cliponaxis=False)
+    st.plotly_chart(fig_arm, use_container_width=True, theme=None)
+    st.caption("Blank bars indicate no eligible subjects recorded for that arm at that site in the current filter selection.")
+
+
+# ────────────────────────────────────────────────────
+# TAB 7 — SITE COMPARISON
+# ────────────────────────────────────────────────────
+with tab7:
+    st.markdown('<div class="info-banner">📌 Formal between-site comparison: chi-square test of independence, a binomial GLM giving odds ratios vs. a chosen reference site, decline-reason breakdown, and normalized funnel shape by site.</div>', unsafe_allow_html=True)
+
+    if not HAS_STATS:
+        st.warning("This tab needs `statsmodels` and `scipy`. Install with `pip install statsmodels scipy` and restart the app.")
+    else:
+        site_stats = df.groupby('screening_site').agg(
+            Eligible=('Eligible_Babies', 'sum'),
+            Consented=('Consented_Babies', 'sum'),
+            Screened=('antscreen_number', 'sum'),
+            NICU_Declined=('nicu_decline', 'sum'),
+            Ant_Declined=('antapproach_declined', 'sum'),
+        ).reset_index()
+        site_stats['Not Consented'] = (site_stats['Eligible'] - site_stats['Consented']).clip(lower=0)
+        site_stats['Consent Rate (%)'] = (site_stats['Consented'] / site_stats['Eligible'].replace(0, np.nan) * 100).round(1)
+
+        # ---- Chi-square test ----
+        st.markdown('<div class="section-title">Chi-square Test — Is Consent Independent of Site?</div>', unsafe_allow_html=True)
+        ct = site_stats.set_index('screening_site')[['Consented', 'Not Consented']]
+        ct = ct[ct.sum(axis=1) > 0]
+        if len(ct) < 2:
+            st.markdown('<div class="no-data">Need at least 2 sites with eligible subjects in the current filter to run a chi-square test.</div>', unsafe_allow_html=True)
+        else:
+            try:
+                chi2, pval, dof, _ = chi2_contingency(ct)
+                render_kpis([
+                    {"label": "Chi-square Statistic", "value": f"{chi2:.2f}", "cls": ""},
+                    {"label": "Degrees of Freedom",    "value": str(dof),     "cls": ""},
+                    {"label": "p-value",               "value": f"{pval:.4g}",
+                     "cls": "green" if pval < 0.05 else "amber",
+                     "sub": "sites differ significantly" if pval < 0.05 else "no significant difference"},
+                ])
+                st.caption("H₀: consent outcome (consented vs. not consented) is independent of screening site — tested on the site × outcome contingency table built from the current filter selection.")
+            except ValueError as e:
+                st.markdown(f'<div class="no-data">Chi-square test not computable on this filter selection (a site or outcome column has zero total): {e}</div>', unsafe_allow_html=True)
+
+        cl, cr = st.columns([1, 1])
+        with cl:
+            st.markdown('<div class="section-title">Consent Rate, Volume & Declines by Site</div>', unsafe_allow_html=True)
+            disp = site_stats.rename(columns={'screening_site': 'Site'}).set_index('Site')
+            download_dataframe('⬇ Download Site Comparison Table', disp, 'site_comparison_filtered.csv', 'dl_site_compare')
+            st.dataframe(disp, use_container_width=True, height=300)
+        with cr:
+            st.markdown('<div class="section-title">NICU Decline-Related Losses by Site</div>', unsafe_allow_html=True)
+            decl = df.groupby('screening_site').agg(
+                Declined=('nicu_decline', 'sum'), Not_Approached=('nicu_notapproach', 'sum'), Too_Late=('nicu_toolate', 'sum')
+            ).reset_index().melt(id_vars='screening_site', var_name='Reason', value_name='Count')
+            fig_decl = px.bar(decl, x='screening_site', y='Count', color='Reason', barmode='stack')
+            fig_decl.update_layout(**plotly_layout(height=300, xaxis_title='Site', yaxis_title='Count', legend_title='Reason'))
+            st.plotly_chart(fig_decl, use_container_width=True, theme=None)
+
+        # ---- Binomial GLM ----
+        st.markdown('<div class="section-title">Binomial GLM — Odds of Consent by Site</div>', unsafe_allow_html=True)
+        ref_site = st.selectbox("Reference site", sorted(selected_sites), index=0, key='glm_ref_site')
+        model_df = df[df['Eligible_Babies'] > 0][['screening_site', 'Eligible_Babies', 'Consented_Babies']].copy()
+        model_df['NotConsented'] = (model_df['Eligible_Babies'] - model_df['Consented_Babies']).clip(lower=0)
+        try:
+            glm = smf.glm(
+                f'Consented_Babies + NotConsented ~ C(screening_site, Treatment(reference="{ref_site}"))',
+                data=model_df, family=sm.families.Binomial()
+            ).fit()
+            or_table = pd.DataFrame({
+                'Term': glm.params.index,
+                'Odds Ratio': np.exp(glm.params.values),
+                'CI Low': np.exp(glm.conf_int()[0].values),
+                'CI High': np.exp(glm.conf_int()[1].values),
+                'p-value': glm.pvalues.values,
+            })
+            or_table['Term'] = or_table['Term'].str.replace(
+                r'C\(screening_site.*?\)\[T\.(.*?)\]', r'\1 vs ' + ref_site, regex=True)
+            or_table = or_table[or_table['Term'] != 'Intercept'].reset_index(drop=True)
+
+            st.dataframe(or_table.round(4).set_index('Term'), use_container_width=True)
+            st.caption(f"Reference site: **{ref_site}**. Odds Ratio > 1 = higher odds of consent than {ref_site}; a 95% CI that excludes 1 is statistically significant at α = 0.05.")
+
+            fig_or = go.Figure()
+            fig_or.add_trace(go.Scatter(
+                x=or_table['Odds Ratio'], y=or_table['Term'], mode='markers',
+                error_x=dict(type='data', symmetric=False,
+                              array=or_table['CI High'] - or_table['Odds Ratio'],
+                              arrayminus=or_table['Odds Ratio'] - or_table['CI Low']),
+                marker=dict(size=11, color='#1e6fd9'),
+            ))
+            fig_or.add_vline(x=1, line_dash='dash', line_color='#c0392b')
+            fig_or.update_layout(**plotly_layout(
+                height=320, xaxis_title='Odds Ratio (log scale)', yaxis_title='',
+                xaxis=dict(type='log', title=dict(standoff=14)),
+            ))
+            st.plotly_chart(fig_or, use_container_width=True, theme=None)
+        except Exception as e:
+            st.warning(f"Model could not be fit on the current filtered data: {e}")
+
+        # ---- Funnel shape comparison ----
+        st.markdown('<div class="section-title">NICU Funnel Shape by Site (Normalized to Eligible = 100%)</div>', unsafe_allow_html=True)
+        shape = df.groupby('screening_site').agg(
+            Eligible=('nicu_eligible1', 'sum'), Approached=('nicu_approached', 'sum'), Consented=('nicu_randomized', 'sum')
+        ).reset_index()
+        for c in ['Approached', 'Consented']:
+            shape[c] = (shape[c] / shape['Eligible'].replace(0, np.nan) * 100).round(1)
+        shape['Eligible'] = 100.0
+        stage_order = ['Eligible', 'Approached', 'Consented']
+
+        fig_shape = go.Figure()
+        for site in selected_sites:
+            row = shape[shape['screening_site'] == site]
+            if row.empty:
+                continue
+            ys = [row.iloc[0][s] for s in stage_order]
+            fig_shape.add_trace(go.Scatter(
+                x=stage_order, y=ys, name=site, mode='lines+markers',
+                line=dict(color=SITE_COLORS.get(site, '#888'), width=2.5), marker=dict(size=8),
+            ))
+        fig_shape.update_layout(**plotly_layout(
+            height=380, xaxis_title='NICU Funnel Stage', yaxis_title='% of Eligible Retained', legend_title='Site',
+        ))
+        st.plotly_chart(fig_shape, use_container_width=True, theme=None)
+        st.caption("Uses the NICU funnel (larger, cleaner volumes) as the shape-comparison reference. A site that drops sharply between Eligible and Approached has an approach-capacity gap; a drop between Approached and Consented points to a decline/conversion problem instead.")
+
+
+# ────────────────────────────────────────────────────
+# TAB 8 — TIME TRENDS / FORECASTING
+# ────────────────────────────────────────────────────
+with tab8:
+    st.markdown('<div class="info-banner">📌 Seasonality by ISO week and calendar month, a single-changepoint detector on the monthly trend, and a pace-based forecast to the 280-baby enrollment goal.</div>', unsafe_allow_html=True)
+
+    # ---- Seasonality ----
+    st.markdown('<div class="section-title">Seasonality</div>', unsafe_allow_html=True)
+    scol1, scol2 = st.columns(2)
+    with scol1:
+        wk_season = df.groupby('week')['Consented_Babies'].sum().reset_index()
+        fig_wks = px.bar(wk_season, x='week', y='Consented_Babies')
+        fig_wks.update_traces(marker_color='#1e6fd9')
+        fig_wks.update_layout(**plotly_layout(
+            height=340, title='Consented by ISO Week-of-Year (All Years Combined)',
+            xaxis_title='ISO Week', yaxis_title='Total Consented'))
+        st.plotly_chart(fig_wks, use_container_width=True, theme=None)
+    with scol2:
+        mo_season = df.copy()
+        mo_season['month_num']  = mo_season['survey_date'].dt.month
+        mo_season['month_name'] = mo_season['survey_date'].dt.strftime('%b')
+        mo_agg = (mo_season.groupby(['month_num', 'month_name'])['Consented_Babies']
+                  .sum().reset_index().sort_values('month_num'))
+        fig_mos = px.bar(mo_agg, x='month_name', y='Consented_Babies')
+        fig_mos.update_traces(marker_color='#2a9d5c')
+        fig_mos.update_layout(**plotly_layout(
+            height=340, title='Consented by Calendar Month (All Years Combined)',
+            xaxis_title='Month', yaxis_title='Total Consented'))
+        st.plotly_chart(fig_mos, use_container_width=True, theme=None)
+    st.caption("These pool every year in the filtered range onto one week/month axis — useful for spotting a recurring seasonal dip (e.g., holidays, summer) rather than a one-time event.")
+
+    # ---- Changepoint detection ----
+    st.markdown('<div class="section-title">Changepoint Detection — Monthly Consented Trend</div>', unsafe_allow_html=True)
+    cp_scope = st.selectbox("Scope", ["All Sites Combined"] + sorted(selected_sites), index=0, key='cp_scope')
+    if cp_scope == "All Sites Combined":
+        cp_series = df.set_index('survey_date').resample('ME')['Consented_Babies'].sum()
+    else:
+        cp_series = (df[df['screening_site'] == cp_scope]
+                     .set_index('survey_date').resample('ME')['Consented_Babies'].sum())
+
+    def _single_changepoint(series):
+        y = series.values.astype(float)
+        n = len(y)
+        if n < 8:
+            return None, None
+        total_ssr = np.sum((y - y.mean()) ** 2)
+        best_ssr, best_idx = np.inf, None
+        for i in range(3, n - 3):
+            left, right = y[:i], y[i:]
+            ssr = np.sum((left - left.mean()) ** 2) + np.sum((right - right.mean()) ** 2)
+            if ssr < best_ssr:
+                best_ssr, best_idx = ssr, i
+        r2 = 1 - best_ssr / total_ssr if total_ssr > 0 else 0.0
+        return best_idx, r2
+
+    cp_idx, cp_r2 = _single_changepoint(cp_series)
+    if cp_idx is None:
+        st.markdown('<div class="no-data">Not enough monthly data points for changepoint detection (need 8+ months in the current filter).</div>', unsafe_allow_html=True)
+    else:
+        cp_y = cp_series.values.astype(float)
+        cp_date = cp_series.index[cp_idx]
+        mean_before, mean_after = cp_y[:cp_idx].mean(), cp_y[cp_idx:].mean()
+
+        render_kpis([
+            {"label": "Detected Changepoint", "value": cp_date.strftime('%b %Y'), "cls": ""},
+            {"label": "Mean Before", "value": f"{mean_before:.1f}/mo", "cls": ""},
+            {"label": "Mean After",  "value": f"{mean_after:.1f}/mo",
+             "cls": "green" if mean_after >= mean_before else "amber"},
+            {"label": "Variance Explained", "value": f"{cp_r2 * 100:.1f}%", "cls": "teal",
+             "sub": "reasonable evidence" if cp_r2 > 0.3 else "weak evidence"},
+        ])
+
+        fig_cp = go.Figure()
+        fig_cp.add_trace(go.Bar(x=cp_series.index, y=cp_series.values, name='Monthly Consented', marker_color='#92b4e3'))
+        fig_cp.add_trace(go.Scatter(x=cp_series.index[:cp_idx], y=[mean_before] * cp_idx, mode='lines',
+                                     name='Mean Before', line=dict(color='#1e6fd9', width=2.5)))
+        fig_cp.add_trace(go.Scatter(x=cp_series.index[cp_idx:], y=[mean_after] * (len(cp_series) - cp_idx), mode='lines',
+                                     name='Mean After', line=dict(color='#c0392b', width=2.5)))
+        # NOTE: add_vline()/add_hline() with annotation_text on a datetime x-axis
+        # triggers a known bug in some plotly versions (its auto-annotation-centering
+        # code tries to average axis endpoints with plain arithmetic, which fails on
+        # datetime values however they're passed in). Building the line + label
+        # manually with add_shape()/add_annotation() avoids that code path entirely.
+        cp_date_str = cp_date.strftime('%Y-%m-%d')
+        fig_cp.add_shape(
+            type='line', x0=cp_date_str, x1=cp_date_str, y0=0, y1=1, yref='paper',
+            line=dict(color='#0b1a36', width=1.5, dash='dot'),
+        )
+        fig_cp.add_annotation(
+            x=cp_date_str, y=1, yref='paper', yanchor='bottom',
+            text='Changepoint', showarrow=False,
+            font=dict(color='#0b1a36', size=11),
+        )
+        fig_cp.update_layout(**plotly_layout(height=380, xaxis_title='Month', yaxis_title='Consented'))
+        st.plotly_chart(fig_cp, use_container_width=True, theme=None)
+        st.caption("Single-changepoint least-squares method: finds the split point that minimizes combined within-segment variance (equivalent to a two-piece constant-mean model fit by OLS). 'Variance explained' is the % reduction in total sum-of-squares from splitting at that point — treat values under ~20% as weak evidence of a real shift rather than noise.")
+
+    # ---- Forecast to goal ----
+    st.markdown('<div class="section-title">Enrollment Pace Forecast to Goal</div>', unsafe_allow_html=True)
+    goal_fc = 280
+    weekly_all = df.set_index('survey_date').resample('W-MON')['Consented_Babies'].sum()
+    total_so_far = int(df['Consented_Babies'].sum())
+    remaining = max(goal_fc - total_so_far, 0)
+    last_date = df['survey_date'].max()
+
+    if remaining <= 0:
+        st.success(f"Goal of {goal_fc} already reached ({total_so_far} consented in the current filter).")
+    elif len(weekly_all) < 2:
+        st.markdown('<div class="no-data">Not enough weekly data in the current filter to forecast a pace.</div>', unsafe_allow_html=True)
+    else:
+        pace_window = st.slider("Recent pace window (weeks)", min_value=4,
+                                 max_value=min(52, len(weekly_all)), value=min(12, len(weekly_all)),
+                                 step=4, key='pace_window')
+        recent_pace  = weekly_all.tail(pace_window).mean()
+        overall_pace = weekly_all.mean()
+
+        def _project(pace):
+            if pace <= 0:
+                return None
+            wk = remaining / pace
+            return last_date + pd.Timedelta(weeks=wk), wk
+
+        proj_recent, proj_overall = _project(recent_pace), _project(overall_pace)
+
+        render_kpis([
+            {"label": "Total Consented to Date", "value": f"{total_so_far:,}", "cls": "green"},
+            {"label": "Remaining to Goal", "value": f"{remaining:,}", "cls": ""},
+            {"label": f"Recent Pace ({pace_window}-wk avg)", "value": f"{recent_pace:.2f}/wk", "cls": "teal"},
+            {"label": "Projected Completion (Recent Pace)",
+             "value": proj_recent[0].strftime('%b %Y') if proj_recent else "pace ≤ 0",
+             "cls": "amber"},
+        ])
+
+        if proj_recent and proj_overall:
+            st.markdown(f"""
+            <div style='font-size:0.85rem; color:#3a4a6a; margin-bottom:1rem; line-height:1.6;'>
+            At the <b>recent {pace_window}-week pace</b> ({recent_pace:.2f} consents/week), the goal is projected
+            around <b>{proj_recent[0].strftime('%B %Y')}</b> (~{proj_recent[1]:.0f} weeks from the last report).<br>
+            At the <b>overall study-to-date pace</b> ({overall_pace:.2f} consents/week), projected around
+            <b>{proj_overall[0].strftime('%B %Y')}</b> (~{proj_overall[1]:.0f} weeks from the last report).
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Linear trend projection on cumulative consents
+        t_idx = np.arange(len(weekly_all))
+        cum_vals = weekly_all.cumsum().values
+        if len(t_idx) >= 4:
+            slope, intercept = np.polyfit(t_idx, cum_vals, 1)
+            n_future = 160
+            future_t = np.arange(len(t_idx), len(t_idx) + n_future)
+            future_cum = slope * future_t + intercept
+            future_dates = [weekly_all.index[-1] + pd.Timedelta(weeks=int(i - len(t_idx) + 1)) for i in future_t]
+
+            fig_fc = go.Figure()
+            fig_fc.add_trace(go.Scatter(x=weekly_all.index, y=cum_vals, name='Actual Cumulative', mode='lines+markers',
+                                         line=dict(color='#0b1a36', width=2.5)))
+            fig_fc.add_trace(go.Scatter(x=future_dates, y=future_cum, name='Linear Trend Projection', mode='lines',
+                                         line=dict(color='#e03e3e', width=2, dash='dash')))
+            fig_fc.add_hline(y=goal_fc, line_dash='dot', line_color='#2a9d5c',
+                              annotation_text=f'Goal: {goal_fc}', annotation_position='right')
+            fig_fc.update_layout(**plotly_layout(
+                height=420, title='Cumulative Enrollment — Linear Trend Projection',
+                xaxis_title='Week', yaxis_title='Cumulative Consented'))
+            st.plotly_chart(fig_fc, use_container_width=True, theme=None)
+
+            if slope > 0:
+                t_goal = (goal_fc - intercept) / slope
+                weeks_from_last = max(t_goal - t_idx[-1], 0)
+                proj_lin_date = weekly_all.index[-1] + pd.Timedelta(weeks=weeks_from_last)
+                st.caption(f"Linear trend fit across the full filtered study period (slope ≈ {slope:.3f} consents/week): projected goal date ≈ **{proj_lin_date.strftime('%B %Y')}**. This smooths over the entire history rather than weighting recent pace, so compare it against the recent-pace estimate above — a large gap between the two suggests enrollment speed has been changing.")
+            else:
+                st.caption("The linear trend across the full filtered period is flat or declining, so a trend-based goal date isn't meaningful here — rely on the recent-pace estimates above instead.")
+
+
+# ────────────────────────────────────────────────────
+# TAB 9 — STATISTICAL MODELING
+# ────────────────────────────────────────────────────
+with tab9:
+    st.markdown('<div class="info-banner">📌 Regression models fit on the current filter: a logistic model of consent probability, a Poisson/negative-binomial model of weekly consent counts, and a bootstrap time-to-goal projection.</div>', unsafe_allow_html=True)
+
+    if not HAS_STATS:
+        st.warning("This tab needs `statsmodels` and `scipy`. Install with `pip install statsmodels scipy` and restart the app.")
+    else:
+        t0 = df['survey_date'].min()
+        df_t = df.copy()
+        df_t['t_weeks'] = ((df_t['survey_date'] - t0).dt.days / 7).round().astype(int)
+        # Reference site for the models below: first selected site alphabetically, so
+        # the model still fits when the sidebar filter excludes WCM entirely.
+        t9_ref_site = sorted(selected_sites)[0] if selected_sites else df_t['screening_site'].iloc[0]
+
+        # ---- Logistic regression: site + time + arm + eligible count ----
+        st.markdown('<div class="section-title">Logistic Regression — Probability of Consent</div>', unsafe_allow_html=True)
+        ant_long = df_t[['screening_site', 't_weeks', 'antscreen_eligible', 'antconsent_random']].rename(
+            columns={'antscreen_eligible': 'Eligible', 'antconsent_random': 'Consented'})
+        ant_long['arm'] = 'Antenatal'
+        nicu_long = df_t[['screening_site', 't_weeks', 'nicu_eligible1', 'nicu_randomized']].rename(
+            columns={'nicu_eligible1': 'Eligible', 'nicu_randomized': 'Consented'})
+        nicu_long['arm'] = 'NICU'
+        long_df = pd.concat([ant_long, nicu_long], ignore_index=True)
+        long_df = long_df[long_df['Eligible'] > 0].copy()
+        long_df['NotConsented'] = (long_df['Eligible'] - long_df['Consented']).clip(lower=0)
+
+        try:
+            logit = smf.glm(
+                'Consented + NotConsented ~ t_weeks + Eligible + '
+                f'C(arm, Treatment(reference="NICU")) + C(screening_site, Treatment(reference="{t9_ref_site}"))',
+                data=long_df, family=sm.families.Binomial()
+            ).fit()
+            lt = pd.DataFrame({
+                'Term': logit.params.index,
+                'Odds Ratio': np.exp(logit.params.values),
+                'CI Low': np.exp(logit.conf_int()[0].values),
+                'CI High': np.exp(logit.conf_int()[1].values),
+                'p-value': logit.pvalues.values,
+            })
+            lt['Term'] = (lt['Term']
+                          .str.replace(r'C\(arm.*?\)\[T\.(.*?)\]', r'\1 vs NICU', regex=True)
+                          .str.replace(r'C\(screening_site.*?\)\[T\.(.*?)\]', r'\1 vs ' + t9_ref_site, regex=True)
+                          .str.replace('t_weeks', 'Calendar time (+1 wk)', regex=False)
+                          .str.replace('Eligible', 'Weekly eligible count (+1)', regex=False))
+            lt = lt[lt['Term'] != 'Intercept'].reset_index(drop=True)
+            st.dataframe(lt.round(4).set_index('Term'), use_container_width=True)
+            st.caption(f"Binomial GLM (logit link), pooled across antenatal and NICU arms with an arm indicator, reference site {t9_ref_site}. OR > 1 = higher odds of consent; a 95% CI excluding 1 is significant at α = 0.05.")
+        except Exception as e:
+            st.warning(f"Logistic model could not be fit on the current filtered data: {e}")
+
+        st.markdown("---")
+
+        # ---- Poisson / Negative Binomial ----
+        st.markdown('<div class="section-title">Weekly Consent Counts — Poisson vs. Negative Binomial</div>', unsafe_allow_html=True)
+        count_df = df_t[['screening_site', 't_weeks', 'Consented_Babies']].copy()
+        try:
+            pois = smf.glm(f'Consented_Babies ~ t_weeks + C(screening_site, Treatment(reference="{t9_ref_site}"))',
+                            data=count_df, family=sm.families.Poisson()).fit()
+            disp_ratio = pois.deviance / pois.df_resid if pois.df_resid > 0 else np.nan
+
+            render_kpis([
+                {"label": "Poisson Deviance / df", "value": f"{disp_ratio:.2f}",
+                 "cls": "amber" if disp_ratio > 1.5 else "green",
+                 "sub": "overdispersed → switching to NB" if disp_ratio > 1.5 else "Poisson assumption OK (≈1)"},
+            ])
+
+            use_model, model_name = pois, "Poisson"
+            if disp_ratio > 1.5:
+                nb = smf.negativebinomial(
+                    f'Consented_Babies ~ t_weeks + C(screening_site, Treatment(reference="{t9_ref_site}"))',
+                    data=count_df).fit(disp=0)
+                use_model, model_name = nb, "Negative Binomial (MLE-estimated dispersion α)"
+
+            irr_t = pd.DataFrame({
+                'Term': use_model.params.index,
+                'IRR': np.exp(use_model.params.values),
+                'CI Low': np.exp(use_model.conf_int()[0].values),
+                'CI High': np.exp(use_model.conf_int()[1].values),
+                'p-value': use_model.pvalues.values,
+            })
+            irr_t = irr_t[~irr_t['Term'].isin(['Intercept', 'alpha'])].copy()
+            irr_t['Term'] = (irr_t['Term']
+                             .str.replace(r'C\(screening_site.*?\)\[T\.(.*?)\]', r'\1 vs ' + t9_ref_site, regex=True)
+                             .str.replace('t_weeks', 'Calendar time (+1 wk)', regex=False))
+            st.markdown(f"**Model used: {model_name}** — incidence rate ratios (IRR) for weekly consented-baby counts.")
+            st.dataframe(irr_t.round(4).set_index('Term'), use_container_width=True)
+            st.caption(f"IRR > 1 = higher weekly consent rate than the reference ({t9_ref_site}). Poisson assumes mean = variance; a deviance/df ratio well above 1 signals overdispersion, in which case the model automatically switches to negative binomial, which estimates an extra dispersion parameter α.")
+        except Exception as e:
+            st.warning(f"Count model could not be fit on the current filtered data: {e}")
+
+        st.markdown("---")
+
+        # ---- Bootstrap time-to-goal ----
+        st.markdown('<div class="section-title">Time-to-Goal Projection (Bootstrap)</div>', unsafe_allow_html=True)
+        goal_tt = 280
+        total_tt = int(df['Consented_Babies'].sum())
+        remaining_tt = max(goal_tt - total_tt, 0)
+        weekly_tt = df.set_index('survey_date').resample('W-MON')['Consented_Babies'].sum()
+
+        if remaining_tt <= 0:
+            st.success(f"Goal of {goal_tt} already reached ({total_tt} consented in the current filter).")
+        elif len(weekly_tt) < 8:
+            st.markdown('<div class="no-data">Not enough weekly data in the current filter for a bootstrap projection.</div>', unsafe_allow_html=True)
+        else:
+            boot_window = st.slider("Bootstrap pool: recent N weeks", min_value=8,
+                                     max_value=min(104, len(weekly_tt)), value=min(26, len(weekly_tt)),
+                                     step=2, key='boot_window')
+            pool = weekly_tt.tail(boot_window).values
+
+            if pool.sum() == 0:
+                st.markdown('<div class="no-data">No consents in the selected recent window — cannot project a completion date from zero pace.</div>', unsafe_allow_html=True)
+            else:
+                rng = np.random.default_rng(42)
+                n_boot, max_weeks = 2000, 500
+                draws = rng.choice(pool, size=(n_boot, max_weeks), replace=True)
+                cum_draws = np.cumsum(draws, axis=1)
+                reached = cum_draws >= remaining_tt
+                weeks_needed = np.where(reached.any(axis=1), reached.argmax(axis=1) + 1, max_weeks)
+
+                med_wk = int(np.median(weeks_needed))
+                lo_wk, hi_wk = np.percentile(weeks_needed, [5, 95])
+                last_dt = df['survey_date'].max()
+                med_date = last_dt + pd.Timedelta(weeks=med_wk)
+                lo_date  = last_dt + pd.Timedelta(weeks=lo_wk)
+                hi_date  = last_dt + pd.Timedelta(weeks=hi_wk)
+
+                render_kpis([
+                    {"label": "Remaining to Goal", "value": str(remaining_tt), "cls": ""},
+                    {"label": "Median Projected Completion", "value": med_date.strftime('%b %Y'), "cls": "teal"},
+                    {"label": "90% Interval", "value": f"{lo_date.strftime('%b %Y')} – {hi_date.strftime('%b %Y')}", "cls": "amber"},
+                ])
+                st.caption(f"Bootstrap resampling ({n_boot:,} draws) from the most recent {boot_window} weeks of consent counts, simulating cumulative enrollment forward until the goal is reached. Median and 90% interval reflect week-to-week variability in that recent pace — a nonparametric empirical projection, appropriate for small, discrete weekly counts where a normal approximation would be unreliable.")
+
+                fig_boot = px.histogram(weeks_needed, nbins=40)
+                fig_boot.update_traces(marker_color='#1a8fa0')
+                fig_boot.update_layout(**plotly_layout(
+                    height=320, xaxis_title='Weeks to Goal (bootstrap draws)', yaxis_title='Frequency', showlegend=False))
+                st.plotly_chart(fig_boot, use_container_width=True, theme=None)
+
+
+# ────────────────────────────────────────────────────
+# TAB 10 — DATA QUALITY / OPERATIONAL
+# ────────────────────────────────────────────────────
+with tab10:
+    st.markdown('<div class="info-banner">📌 Weekly reporting completeness by site (unfiltered — reflects the full uploaded file), duplicate-report checks, common themes in consent notes, and trends in timing-related losses (aged-out / too-late).</div>', unsafe_allow_html=True)
+
+    # ---- Weekly reporting completeness ----
+    st.markdown('<div class="section-title">Weekly Reporting Completeness by Site</div>', unsafe_allow_html=True)
+    overall_min, overall_max = raw_data['survey_date'].min(), raw_data['survey_date'].max()
+    full_grid = pd.date_range(overall_min, overall_max, freq='W-MON')
+    rows = []
+    for site in sorted(s for s in raw_data['screening_site'].unique() if s != 'Unknown'):
+        sd = raw_data[raw_data['screening_site'] == site]
+        present = set(sd['survey_date'].dt.normalize())
+        n_missing = sum(1 for d in full_grid if d not in present)
+        rows.append({
+            'Site': site, 'Expected Weeks': len(full_grid), 'Reported Weeks': len(present),
+            'Missing Weeks': n_missing, '% Complete': round(len(present) / len(full_grid) * 100, 1),
+        })
+    complete_df = pd.DataFrame(rows).set_index('Site')
+
+    ccol1, ccol2 = st.columns([1, 1.2])
+    with ccol1:
+        download_dataframe('⬇ Download Completeness Table', complete_df, 'reporting_completeness.csv', 'dl_completeness')
+        st.dataframe(complete_df, use_container_width=True, height=230)
+    with ccol2:
+        fig_comp = px.bar(complete_df.reset_index(), x='Site', y='% Complete', color='Site',
+                           color_discrete_map=SITE_COLORS, text='% Complete')
+        fig_comp.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig_comp.add_hline(y=100, line_dash='dot', line_color='#2a9d5c')
+        fig_comp.update_layout(**plotly_layout(
+            height=280, showlegend=False, yaxis=dict(range=[0, 110]), xaxis_title='', yaxis_title='% of Expected Weeks Reported'))
+        fig_comp.update_traces(textfont_color="#0f1f3d", cliponaxis=False)
+        st.plotly_chart(fig_comp, use_container_width=True, theme=None)
+    st.caption("Based on the full cleaned file (not the sidebar site/date filters) — this is a reporting-compliance check, and filtering the date range would create artificial 'missing weeks' at the edges.")
+
+    # ---- Duplicate weekly reports ----
+    dupe_check = raw_data.groupby(['screening_site', 'survey_date']).size().reset_index(name='n_reports')
+    dupes = dupe_check[dupe_check['n_reports'] > 1]
+    if len(dupes):
+        st.markdown(f'<div class="no-data">⚠️ {len(dupes)} site-week combination(s) have more than one report on file — possible duplicate entry worth checking in REDCap:</div>', unsafe_allow_html=True)
+        st.dataframe(
+            dupes.rename(columns={'screening_site': 'Site', 'survey_date': 'Survey Date', 'n_reports': '# Reports'}).set_index('Site'),
+            use_container_width=True)
+    else:
+        st.markdown("""
+        <div class="audit-card" style="padding:0.9rem 1.3rem; margin-bottom:0;">
+            <ul class="audit-step-list"><li><span class="tick">✓</span> No duplicate site-week reports detected.</li></ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ---- Consent notes — common themes ----
+    st.markdown('<div class="section-title">Consent Notes — Common Themes</div>', unsafe_allow_html=True)
+    notes = df['consent_notes'].dropna().astype(str)
+    if notes.empty:
+        st.markdown('<div class="no-data">No consent notes in the current filter selection.</div>', unsafe_allow_html=True)
+    else:
+        STOPWORDS = set("""the a an and or of to in on for with at by from as is was were be been being
+        this that these those it its our their his her they he she we you your not no yes patient family
+        mom mother dad father will did does do has have had all if than then so re per""".split())
+        tokens = []
+        for n in notes:
+            words = re.findall(r"[a-zA-Z']+", n.lower())
+            tokens.extend([w for w in words if w not in STOPWORDS and len(w) > 2])
+        counts = Counter(tokens)
+        top_words = pd.DataFrame(counts.most_common(20), columns=['Word', 'Count'])
+
+        ncol1, ncol2 = st.columns([1, 1.3])
+        with ncol1:
+            fig_words = px.bar(top_words.sort_values('Count'), x='Count', y='Word', orientation='h')
+            fig_words.update_traces(marker_color='#1e6fd9')
+            fig_words.update_layout(**plotly_layout(height=460, xaxis_title='Occurrences', yaxis_title=''))
+            st.plotly_chart(fig_words, use_container_width=True, theme=None)
+        with ncol2:
+            st.markdown(f"**{len(notes)} notes** in the current filter selection.")
+            search_term = st.text_input("Search notes for a keyword", key='notes_search')
+            note_disp = df.loc[df['consent_notes'].notna(), ['survey_date', 'screening_site', 'consent_notes']].rename(
+                columns={'survey_date': 'Date', 'screening_site': 'Site', 'consent_notes': 'Note'})
+            if search_term:
+                note_disp = note_disp[note_disp['Note'].str.contains(search_term, case=False, na=False)]
+            download_dataframe('⬇ Download Consent Notes', note_disp, 'consent_notes_filtered.csv', 'dl_notes')
+            st.dataframe(note_disp.set_index('Date'), use_container_width=True, height=380)
+        st.caption("Word list excludes common English stopwords and is built only from free-text notes — not a validated NLP classification, but useful for spotting recurring operational themes (e.g., 'discharged', 'window', 'declined').")
+
+    st.markdown("---")
+
+    # ---- Timing-related losses ----
+    st.markdown('<div class="section-title">Timing-Related Losses — Aged Out (Antenatal) & Too Late (NICU)</div>', unsafe_allow_html=True)
+    tl_by_site = df.groupby('screening_site')[['antapproach_agedout', 'nicu_toolate']].sum().reset_index()
+    tl_by_site.columns = ['Site', 'Aged Out (Antenatal)', 'Too Late (NICU)']
+
+    tcol1, tcol2 = st.columns([1, 1.3])
+    with tcol1:
+        download_dataframe('⬇ Download Timing-Loss Table', tl_by_site.set_index('Site'), 'timing_losses_by_site.csv', 'dl_timing')
+        st.dataframe(tl_by_site.set_index('Site'), use_container_width=True, height=230)
+    with tcol2:
+        tl_long = tl_by_site.melt(id_vars='Site', var_name='Reason', value_name='Count')
+        fig_tl = px.bar(tl_long, x='Site', y='Count', color='Reason', barmode='group',
+                         color_discrete_map={'Aged Out (Antenatal)': '#e09c2a', 'Too Late (NICU)': '#c0392b'})
+        fig_tl.update_layout(**plotly_layout(height=280, xaxis_title='', yaxis_title='Count', legend_title='Reason'))
+        st.plotly_chart(fig_tl, use_container_width=True, theme=None)
+
+    tl_trend = df.groupby(pd.Grouper(key='survey_date', freq='ME'))[['antapproach_agedout', 'nicu_toolate']].sum().reset_index()
+    fig_tlt = go.Figure()
+    fig_tlt.add_trace(go.Scatter(x=tl_trend['survey_date'], y=tl_trend['antapproach_agedout'], name='Aged Out (Antenatal)',
+                                  mode='lines+markers', line=dict(color='#e09c2a', width=2.5)))
+    fig_tlt.add_trace(go.Scatter(x=tl_trend['survey_date'], y=tl_trend['nicu_toolate'], name='Too Late (NICU)',
+                                  mode='lines+markers', line=dict(color='#c0392b', width=2.5)))
+    fig_tlt.update_layout(**plotly_layout(height=340, title='Monthly Trend', xaxis_title='Month', yaxis_title='Count'))
+    st.plotly_chart(fig_tlt, use_container_width=True, theme=None)
+    st.caption("Aged-out and too-late cases reflect timing/logistics gaps (missed enrollment windows) rather than family refusal — a persistently high or rising count at a site may point to staffing or workflow issues worth investigating operationally, rather than a consent/messaging problem.")
