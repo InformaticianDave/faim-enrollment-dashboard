@@ -1,7 +1,44 @@
+# ── Protected / sensitive data ──────────────────────────────────────────
+# Never commit real REDCap exports or any cleaned output derived from them.
+# This repo ships code only — data stays local to whoever runs the app.
 *.csv
 !sample_data/*.csv
+data/
+*.xlsx
+*.xls
+FAIM*_DATA_*.csv
+FAIM_cleaned_*.csv
+
+# ── Python ───────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.Python
+build/
+dist/
+*.egg
+
+# ── Virtual environments ────────────────────────────────────────────────
 .venv/
 venv/
+env/
+ENV/
+
+# ── Streamlit ────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── Editors / OS ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
 .DS_Store
+Thumbs.db
+
+# ── Jupyter ──────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Logs / local scratch ─────────────────────────────────────────────────
+*.log
+.pytest_cache/
